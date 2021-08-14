@@ -35,7 +35,7 @@
 
 // GPIO pin for input and output, GPIO24 
 // note that physical connector pin number is different
-static int gpio = 24;
+static int gpio = 4;
 
 // last measurement time, next measurement can not be done
 // until measurement period has passed (see MEASUREMENT_PERIOD)
@@ -45,128 +45,156 @@ static long last_time = 0;
 // driver will sleep until this period has passed
 #define MEASUREMENT_PERIOD 2000 
 
-// if no data, loop max count and exit
-#define MAX_LOOP_COUNT 10000
-
 // GPIO high (3.3V or 5V)
 #define HIGH 1
 
 // GPIO low (0V)
 #define LOW 0
 
-/*
- * Wait until GPIO changes to state 
- * 
- * returns 0 if changed successfully, 1 if no change
- */
-int wait_for_gpio(int state) 
-{
-	int i;
+// Constant for indicating pulse waiting timeout
+#define WAITTIMEOUT 0xFFFFFFFFFFFFFFFF
 
-	/// MAX_LOOP_COUNT prevents driver from crashing when there is no data
-	for (i=0; i<MAX_LOOP_COUNT; i++) {
-		if (gpio_get_value(gpio) == state) {
-			return 0;
+// Expect the signal line to be at the specified level for a period of time and
+// return a count of loop cycles spent at that level (this cycle count can be
+// used to compare the relative time of two pulses).  If more than a millisecond
+// ellapses without the level changing then the call fails with a 0 response.
+// This is adapted from Arduino's pulseInLong function (which is only available
+// in the very latest IDE versions):
+//   https://github.com/arduino/Arduino/blob/master/hardware/arduino/avr/cores/arduino/wiring_pulse.c
+u64 expectPulse(int state) {
+	u64 nsTime = 0;
+
+	u64 start = ktime_get_real_ns();
+
+	while (gpio_get_value(gpio) == state) {
+		nsTime = ktime_get_real_ns() - start;
+		if(nsTime > 1000000){
+			return WAITTIMEOUT;
 		}
-	}	
+	}
 
-	// always fail if max loop count hit
-	return 1;
+	return nsTime;
+}
+
+typedef struct {
+	char msg[100];
+	s32 temp;
+	s32 humidity;
+} ret;
+static ret returnValue;
+
+static void run(void)
+{
+	s32 temp, humidity;
+	u8 data[5];
+	u64 nstimes[80];
+	int i;
+	u64 lowCycles, highCycles;
+
+	returnValue.temp = 0;
+	returnValue.humidity = 0;
+
+	// Go into high impedence state to let pull-up raise data line level and
+	// start the reading process.
+	gpio_direction_input(gpio);
+	mdelay(1);
+
+	// First set data line low for a period
+	gpio_direction_output(gpio, 0);
+	udelay(1100);
+
+	{
+		// End the start signal by setting data line high for 40 microseconds.
+		gpio_direction_input(gpio);
+
+		// Delay a moment to let sensor pull data line low.
+		udelay(55);
+
+		// Now start reading the data line to get the value from the DHT sensor.
+		// Turn off interrupts temporarily because the next sections
+		// are timing critical and we don't want any interruptions.
+		local_irq_disable();
+
+		// First expect a low signal for ~80 microseconds followed by a high signal
+		// for ~80 microseconds again.
+		if(expectPulse(LOW) == WAITTIMEOUT){
+			strcpy(returnValue.msg, "error: timeout waiting for start signal low pulse");
+			return;
+		}
+
+		if(expectPulse(HIGH) == WAITTIMEOUT){
+			strcpy(returnValue.msg, "error: timeout waiting for start signal high pulse");
+			return;
+		}
+
+		// Now read the 40 bits sent by the sensor.  Each bit is sent as a 50
+		// microsecond low pulse followed by a variable length high pulse.  If the
+		// high pulse is ~28 microseconds then it's a 0 and if it's ~70 microseconds
+		// then it's a 1.  We measure the cycle count of the initial 50us low pulse
+		// and use that to compare to the cycle count of the high pulse to determine
+		// if the bit is a 0 (high state cycle count < low state cycle count), or a
+		// 1 (high state cycle count > low state cycle count). Note that for speed
+		// all the pulses are read into a array and then examined in a later step.
+		for (i = 0; i < 80; i += 2) {
+			nstimes[i] = expectPulse(LOW);
+			nstimes[i + 1] = expectPulse(HIGH);
+		}
+	} // Timing critical code is now complete.
+	local_irq_enable();
+
+	// Inspect pulses and determine which ones are 0 (high state cycle count < low
+	// state cycle count), or 1 (high state cycle count > low state cycle count).
+	for (i = 0; i < 40; ++i) {
+		lowCycles = nstimes[2 * i];
+		highCycles = nstimes[2 * i + 1];
+		if ((lowCycles == WAITTIMEOUT) || (highCycles == WAITTIMEOUT)) {
+			strcpy(returnValue.msg, "error: timeout waiting for a pulse");
+			return;
+		}
+		data[i / 8] <<= 1;
+		// Now compare the low and high cycle times to see if the bit is a 0 or 1.
+		if (highCycles > lowCycles) {
+			// High cycles are greater than 50us low cycle count, must be a 1.
+			data[i / 8] |= 1;
+		}
+		// Else high cycles are less than (or equal to, a weird case) the 50us low
+		// cycle count so this must be a zero.  Nothing needs to be changed in the
+		// stored data.
+	}
+
+	if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
+		// Parse temp
+		temp = ((u16)(data[2] & 0x7F)) << 8 | data[3];
+		if (data[2] & 0x80) {
+			temp = -temp;
+		}
+
+		// Parse humidity
+		humidity = ((u16)data[0]) << 8 | data[1];
+
+		returnValue.temp = temp;
+		returnValue.humidity = humidity;
+		strcpy(returnValue.msg, "ok");
+		return;
+	} else {
+		strcpy(returnValue.msg, "error: checksum error");
+		return;
+	}
 }
 
 static int am2301_show(struct seq_file *m, void *v)
 {
-	int i, res;
-	int databyte = 0L;
-	int d = 0, b = 0;
-	char status[20];
-	int data[5];
-	int rh,t;
+	s32 t, h;
 
-	ktime_t start, stop;
-	int nodata_error = 0; // 1 if no data from AM2301
+	run();
 
-        gpio_direction_output(gpio, 1);
+	t = returnValue.temp;
+	h = returnValue.humidity;
 
-        udelay(2000);
+	seq_printf(m, "%d.%d RH, %d.%d C, %s\n", h/10, h%10, t/10, t%10, returnValue.msg);
 
-        /*
-         * Set pin low and wait for at least 800 us.
-         * Set it high again, then wait for the sensor to put out a low pulse.
-         */
-        gpio_set_value(gpio, 0);
-        udelay(1000);
-
-	// Disable interrupts during measurement, this is critical for 
-	// reliable time measurements when receiving high speed data.
-	// All Kernel interrupts are disabled for about 2-3 milliseconds.
-
-	local_irq_disable();
-
-        gpio_set_value(gpio, 1);
-
-	gpio_direction_input(gpio);
-
-	nodata_error |= wait_for_gpio(LOW);
-	nodata_error |= wait_for_gpio(HIGH);
-	nodata_error |= wait_for_gpio(LOW);
- 			
-	
-	for ( i=0; i<40; i++) {
-		wait_for_gpio(HIGH);
-		
-		// now measure length of high state in nanoseconds
-
-		start = ktime_get_real();
-		wait_for_gpio(LOW);
-		stop = ktime_get_real();
-		res = (int)(stop.tv64 - start.tv64);
-
-		// 1st data bit is shorter, why ? 
-
-		if ((i==0 && res > 29000) || ( i!=0 && res > 40000)) {
-			databyte|=0x01;
-		} 
-		d++;
-		if (d==8) {
-			d=0;
-			data[b]=databyte;
-		b=b+1;
-		databyte=0x00;
-	}
-	databyte<<=1;		
+	return 0;
 }
-
-local_irq_enable();
-wait_for_gpio(HIGH);
-
-        gpio_direction_output(gpio, 1);
-	
-	if (((data[0] + data[1] + data[2] + data[3]) & 0xff) == data[4]) {
-		strcpy(status, "ok");
-	} else  {
-		strcpy(status, "error, checksum");
-	}
-	if (nodata_error) {
-		strcpy(status, "error, no data");
-	}
-
-	// check flag for negative temperatures
-	rh = ((data[0]<<8) + data[1] );
-
-	if (data[2] & 0x80) {
-		data[2] = data[2] & 0x7f;
-		t  = (data[2]<<8) + data[3];
-		seq_printf(m, "%d.%d RH, -%d.%d C, %s\n", rh/10, rh%10, t/10, t%10, status);
-	} else {
-		t = (data[2]<<8) + data[3];
-		seq_printf(m, "%d.%d RH, %d.%d C, %s\n", rh/10, rh%10, t/10, t%10, status);
-	}
-
-        return 0;
-}
-
-
 
 static int am2301_open(struct inode *inode, struct  file *file) 
 {
@@ -180,14 +208,11 @@ static int am2301_open(struct inode *inode, struct  file *file)
 	return single_open(file, am2301_show, NULL);
 }
 
-
-static const struct file_operations am2301_fops = 
-{
-	.owner = THIS_MODULE,
-	.open = am2301_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
+static struct proc_ops am2301_fops = {
+    .proc_open = am2301_open,
+    .proc_release = single_release,
+    .proc_read = seq_read,
+    .proc_lseek = seq_lseek
 };
 
 static int __init am2301_init(void)
